@@ -1,5 +1,5 @@
 [workspace]
-members = ["querier"]
+members = ["persister", "querier"]
 
 [workspace.package]
 version = "0.1.0"
