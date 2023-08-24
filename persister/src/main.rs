@@ -1,129 +1,151 @@
-use arrow::array::AsArray;
-use arrow::datatypes::{Date64Type, Float64Type};
+use chrono::{Utc, DateTime};
+
+use duckdb::{params, Connection, Result};
+
 use futures::TryStreamExt;
-
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::basic::{ConvertedType, Type as PhysicalType};
-use parquet::data_type::{Int64Type, DoubleType};
-use parquet::file::writer::SerializedFileWriter;
-use parquet::file::properties::WriterProperties;
-use parquet::schema::types::Type;
-
-use std::env;
-use std::fs::File;
-use std::sync::Arc;
-
 use sqlx::Row;
 use sqlx::sqlite::SqlitePool;
 
-/// Represents a new row to be added or merged into the Parquet file.
+use std::env;
+use std::path::Path;
+
 pub struct Record {
-    pub time: i64,
+    pub time: DateTime<Utc>,
     pub values: Vec<f64>,
 }
 
-fn load_parquet_rows(path: &str, columns: usize) -> Result<Vec<Record>, Box<dyn std::error::Error>> {
-    if std::path::Path::new(path).exists() {
-        return Ok(vec![]);
-    }
+pub fn merge_new_records(parquet_path: &str, new_records: Vec<Record>) -> Result<()> {
+    let conn = Connection::open_in_memory()?;
+    conn.execute_batch("INSTALL parquet; LOAD parquet;")?;
 
-    let file = File::open(path)?;
-    let arrow_reader = ParquetRecordBatchReaderBuilder::try_new(file)?
-        .with_batch_size(8192)
-        .build()?;
-
-    let mut rows: Vec<Record> = vec![];
-    for batch in arrow_reader {
-        while let Ok(ref b) = batch {
-            let time_array = b
-                .column(0)
-                .as_primitive::<Date64Type>()
-                .clone();
-            let mut values_vecs: Vec<Vec<f64>> = vec![vec![]; columns];
-            for i in 0..columns {
-                let values_array = b
-                    .column(i + 1)
-                    .as_primitive::<Float64Type>();
-                for j in 0..values_array.len() {
-                    values_vecs[i].push(values_array.value(j));
-                }
-            }
-
-            for i in 0..time_array.len() {
-                let mut values: Vec<f64> = vec![];
-                for j in 0..values_vecs.len() {
-                    values.push(values_vecs[j][i]);
-                }
-                rows.push(Record {
-                    time: time_array.value(i),
-                    values,
-                });
-            }
-
+    let fields =  match new_records.get(0) {
+        Some(first) => {
+            first.values.iter().fold(0, |acc, _| acc + 1)
+        },
+        None => {
+            // TODO must return an error
+            return Ok(());
         }
-    }
+    };
 
-    Ok(rows)
-}
-
-fn write_parquet(path: &str, columns: usize, rows: Vec<Record>)  -> Result<(), Box<dyn std::error::Error>> {
-    // Define the schema for the data
-    let time_field = Type::primitive_type_builder("time", PhysicalType::INT64)
-        .with_converted_type(ConvertedType::TIMESTAMP_MILLIS)
-        .build()?;
-
-    let mut fields = vec![Arc::new(time_field)];
-    for i in 0..columns {
-        let name = std::format!("c{}", i);
-        let field = Type::primitive_type_builder(&name, PhysicalType::DOUBLE)
-            .build()?;
-        fields.push(Arc::new(field));
-    }
-
-    let schema = Type::group_type_builder("schema")
-        .with_fields(&mut fields)
-        .build()?;
-
-    // Write to Parquet
-    let file = File::create(path)?;
-    let props = WriterProperties::builder().build();
-    let mut writer = SerializedFileWriter::new(file, Arc::new(schema), Arc::new(props))?;
-    let mut row_group_writer = writer.next_row_group()?;
-
-    if  let Some(mut col_writer) = row_group_writer.next_column()? {
-        let time_values: Vec<i64> = rows.iter().map(|row| row.time).collect();
-        col_writer
-            .typed::<Int64Type>()
-            .write_batch(&time_values, None, None)?;
-        col_writer.close()?
-    }
-
-    for i in 1..columns {
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            let values: Vec<f64> = rows.iter().map(|row| row.values[i]).collect();
-            col_writer.typed::<DoubleType>()
-                .write_batch(&values, None, None)?;
-            col_writer.close()?
+    let table = "tmp";
+    let sql = if Path::exists(Path::new(parquet_path)) {
+        println!("{} was found. Load the Parquet file.", parquet_path);
+        format!("CREATE TEMP TABLE {} AS SELECT * FROM read_parquet('{}')", table, parquet_path)
+    } else {
+        println!("{} does not exit. Define a new table.", parquet_path);
+        let mut columns = "time TIMESTAMP PRIMARY KEY".to_string();
+        for i in 0..fields {
+            columns += &format!(", f{} DOUBLE", i);
         }
-    }
+        format!("CREATE TEMP TABLE {} ( {} )", table, columns)
+    };
 
-    row_group_writer.close()?;
-    writer.close()?;
+    conn.execute(&sql, params![])?;
+
+    let sql = compose_insert_query(table, fields, new_records);
+    conn.execute(&sql, params![])?;
+
+    let sql = &format!("COPY (SELECT * FROM {} ORDER BY time ASC) TO '{}' (FORMAT 'parquet')", table, parquet_path);
+    conn.execute(&sql, params![])?;
 
     Ok(())
 }
 
-fn update_or_create_parquet(path: &str, new_rows: Vec<Record>) -> Result<(), Box<dyn std::error::Error>> {
-    let columns = new_rows[0].values.len();
-    let mut rows = load_parquet_rows(path, columns)?;
+fn compose_insert_query(table: &str, fields: usize, records: Vec<Record>) -> String {
+    let sql = &format!("INSERT INTO {} VALUES", table);
 
-    // Merge new rows
-    rows.extend(new_rows);
-    rows.sort_by_key(|row| row.time);
+    let rows: Vec<String> = records.iter().map(|record| {
+        let colls: Vec<String> = (0..fields).map(|i| {
+            if let Some(v) = record.values.get(i) {
+                format!("{}", v)
+            } else {
+                "NULL".to_string()
+            }
+        }).collect();
+        let time = record.time.format("%Y-%m-%d %H:%M:%S%.3f");
+        format!("('{}', {})", time, colls.join(", "))
+    }).collect();
 
-    write_parquet(path, columns, rows)
+    format!("{} {}", sql, rows.join(", "))
 }
 
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone;
+
+    use super::*;
+
+    #[test]
+    fn test_a() {
+        let parquet = "./test.parquet";
+        let path = Path::new(parquet);
+        if Path::exists(path) {
+            std::fs::remove_file(path).unwrap();
+        }
+
+        let records = vec![
+            Record{
+                time: Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(),
+                values: vec![1.0, 2.0, 3.0],
+            },
+            Record{
+                time: Utc.with_ymd_and_hms(2023, 1, 2, 0, 0, 0).unwrap(),
+                values: vec![4.0, 5.0, 6.0],
+            },
+            Record{
+                time: Utc.with_ymd_and_hms(2023, 1, 3, 0, 0, 0).unwrap(),
+                values: vec![7.0, 8.0, 9.0],
+            },
+        ];
+        let _ = merge_new_records(parquet, records).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("INSTALL parquet; LOAD parquet;").unwrap();
+        let sql = format!("SELECT * FROM read_parquet('{}')", parquet);
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let iter = stmt.query_map([], |row| {
+            // println!("{}", row.get(0).unwrap());
+            let f0: f64 = row.get(1).unwrap();
+            let f1: f64 = row.get(2).unwrap();
+            let f2: f64 = row.get(3).unwrap();
+            Ok(format!("{} {} {}", f0, f1, f2))
+        }).unwrap();
+
+        let mut result = "".to_string();
+        for i in iter {
+            result += &format!("{}, ", &i.unwrap());
+        }
+        assert_eq!(result, "1 2 3, 4 5 6, 7 8 9, ");
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_compose_insert_query() {
+        let sql = compose_insert_query("foo", 0,  vec![]);
+        assert_eq!(sql, "INSERT INTO foo VALUES ");
+
+        let sql = compose_insert_query("foo", 1,  vec![]);
+        assert_eq!(sql, "INSERT INTO foo VALUES ");
+
+        let sql = compose_insert_query("foo", 3,  vec![
+            Record{
+                time: Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(),
+                values: vec![1.0, 2.0, 3.0],
+            },
+            Record{
+                time: Utc.with_ymd_and_hms(2023, 1, 2, 0, 0, 0).unwrap(),
+                values: vec![1.0, 2.0],
+            },
+            Record{
+                time: Utc.with_ymd_and_hms(2023, 1, 3, 0, 0, 0).unwrap(),
+                values: vec![1.0, 2.0, 3.0, 4.0],
+            },
+        ]);
+        assert_eq!(sql, "INSERT INTO foo VALUES ('2023-01-01 00:00:00.000', 1, 2, 3), ('2023-01-02 00:00:00.000', 1, 2, NULL), ('2023-01-03 00:00:00.000', 1, 2, 3)");
+    }
+}
 
 fn get_data_root() -> String {
     env::var("DATA_ROOT").unwrap_or_else(|_| env::current_dir().unwrap().to_str().unwrap().to_string())
@@ -146,10 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // TODO must generate new_rows from the payload
             let _p: String = row.try_get("payload")?;
             let new_rows: Vec<Record> = vec![];
-            if let Err(e) = update_or_create_parquet(&path, new_rows) {
-                eprintln!("Error saving to parquet: {}", e);
-                continue;
-            }
+            merge_new_records(&path, new_rows)?;
         }
 
         std::thread::sleep(std::time::Duration::from_secs(10));
