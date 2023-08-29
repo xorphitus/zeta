@@ -2,6 +2,8 @@ use chrono::{Utc, DateTime};
 
 use duckdb::{params, Connection, Result};
 
+use itertools::Itertools;
+
 use futures::TryStreamExt;
 use sqlx::Row;
 use sqlx::sqlite::SqlitePool;
@@ -10,6 +12,7 @@ use std::env;
 use std::path::Path;
 
 pub struct Record {
+    pub destination: String,
     pub time: DateTime<Utc>,
     pub values: Vec<f64>,
 }
@@ -86,14 +89,17 @@ mod tests {
 
         let records = vec![
             Record{
+                destination: "".to_string(),
                 time: Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(),
                 values: vec![1.0, 2.0, 3.0],
             },
             Record{
+                destination: "".to_string(),
                 time: Utc.with_ymd_and_hms(2023, 1, 2, 0, 0, 0).unwrap(),
                 values: vec![4.0, 5.0, 6.0],
             },
             Record{
+                destination: "".to_string(),
                 time: Utc.with_ymd_and_hms(2023, 1, 3, 0, 0, 0).unwrap(),
                 values: vec![7.0, 8.0, 9.0],
             },
@@ -131,14 +137,17 @@ mod tests {
 
         let sql = compose_insert_query("foo", 3,  vec![
             Record{
+                destination: "".to_string(),
                 time: Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(),
                 values: vec![1.0, 2.0, 3.0],
             },
             Record{
+                destination: "".to_string(),
                 time: Utc.with_ymd_and_hms(2023, 1, 2, 0, 0, 0).unwrap(),
                 values: vec![1.0, 2.0],
             },
             Record{
+                destination: "".to_string(),
                 time: Utc.with_ymd_and_hms(2023, 1, 3, 0, 0, 0).unwrap(),
                 values: vec![1.0, 2.0, 3.0, 4.0],
             },
@@ -147,8 +156,67 @@ mod tests {
     }
 }
 
+
+async fn load_wal() -> Result<()> {
+    let data_root = &get_data_root();
+    let root_path = Path::new(data_root);
+    let db_url = if let Some(path) = root_path.join("wal.sqlite").to_str() {
+        format!("sqlite://{}", path)
+    } else {
+        // TODO must return an error
+        return Ok(());
+    };
+    let pool = SqlitePool::connect(&db_url).await.map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::Other, format!("Database connection error: {}", e))
+    }).unwrap();
+
+    let new_rows: Vec<Record> = vec![];
+    let mut rows = sqlx::query("SELECT * FROM wal").fetch(&pool);
+    while let Some(row) = rows.try_next().await? {
+        let id: String = row.try_get("project_id")?;
+        let schema: String = row.try_get("schema")?;
+        let joined = root_path.join(id).join(schema);
+        let parquet_path = if let Some(path) = joined.to_str() {
+            path
+        } else {
+            // TODO must return an error
+            return Ok(());
+        };
+
+        // TODO must generate new_rows from the payload
+        let payload: String = row.try_get("payload")?;
+        let str_vals: Vec<&str> = payload.split(",").map(|f| f.trim()).collect();
+        let mut values: Vec<f64> = vec![];
+        for val in str_vals {
+            match val.parse::<f64>() {
+                Ok(v) => {
+                    values.push(v);
+                }
+                Err(_) => {
+                    // TODO show the error and dispose the row
+                    return Ok(());
+                }
+            }
+        }
+        let record = Record{
+            destination: parquet_path.to_string(),
+            time: "a",
+            values,
+        };
+        new_rows.push(record);
+    }
+
+    let new_row_groups = new_rows.into_iter().into_group_map_by(|r| r.destination);
+
+    for (k, v) in new_row_groups {
+        merge_new_records(&k, v)?
+    }
+
+    Ok(())
+}
+
 fn get_data_root() -> String {
-    env::var("DATA_ROOT").unwrap_or_else(|_| env::current_dir().unwrap().to_str().unwrap().to_string())
+     env::var("DATA_ROOT").unwrap_or_else(|_| env::current_dir().unwrap().to_str().unwrap().to_string())
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -159,17 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     loop {
-        let mut rows = sqlx::query("SELECT * FROM wal").fetch(&pool);
-        while let Some(row) = rows.try_next().await? {
-            let id: String = row.try_get("project_id")?;
-            let schema_name: String = row.try_get("schema")?;
-            let path = format!("{}/{}/{}", data_root, id, schema_name);
-
-            // TODO must generate new_rows from the payload
-            let _p: String = row.try_get("payload")?;
-            let new_rows: Vec<Record> = vec![];
-            merge_new_records(&path, new_rows)?;
-        }
+        load_wal().await?;
 
         std::thread::sleep(std::time::Duration::from_secs(10));
     }
